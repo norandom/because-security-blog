@@ -1,0 +1,21 @@
+[project]
+name = "blog-backend"
+version = "0.1.0"
+description = "Blog backend API with markdown file reading"
+dependencies = [
+    "fastapi>=0.104.1",
+    "uvicorn>=0.24.0",
+    "python-frontmatter>=1.0.1",
+    "python-multipart>=0.0.6",
+    "pydantic>=2.5.0",
+    "markdown>=3.5.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "nuitka>=1.8.0",
+]

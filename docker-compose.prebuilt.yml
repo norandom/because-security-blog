@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  blog-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.prebuilt
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./posts:/posts:ro
+    environment:
+      - POSTS_DIRECTORY=/posts
+      - HOST=0.0.0.0
+      - PORT=8000

@@ -1,0 +1,110 @@
+name: Build Nuitka Binary
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest  # This is just the GitHub Actions runner
+    container:
+      # This is the actual build environment - Debian 12 (bookworm)
+      # which matches gcr.io/distroless/cc-debian12
+      image: python:3.11-slim-bookworm
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install build dependencies
+      run: |
+        apt-get update
+        apt-get install -y build-essential ccache patchelf
+        # Verify we're on Debian 12
+        cat /etc/debian_version
+        ldd --version | head -1
+    
+    - name: Install Python dependencies
+      run: |
+        pip install uv
+        uv venv
+        . .venv/bin/activate
+        uv pip install -e . nuitka
+    
+    - name: Build with Nuitka
+      run: |
+        . .venv/bin/activate
+        python -m nuitka \
+          --standalone \
+          --onefile \
+          --assume-yes-for-downloads \
+          --output-dir=dist \
+          --output-filename=blog-backend \
+          --include-package=blog_backend \
+          --include-package=fastapi \
+          --include-package=uvicorn \
+          --include-package=frontmatter \
+          --include-package=markdown \
+          --include-package=pydantic \
+          --enable-plugin=anti-bloat \
+          --show-progress \
+          run.py
+    
+    - name: Test binary compatibility
+      run: |
+        ldd dist/blog-backend || echo "Binary is statically linked"
+        file dist/blog-backend
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: blog-backend-binary
+        path: dist/blog-backend
+        retention-days: 30
+    
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dist/blog-backend
+        generate_release_notes: true
+
+  build-docker:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download binary
+      uses: actions/download-artifact@v4
+      with:
+        name: blog-backend-binary
+        path: dist/
+    
+    - name: Make binary executable
+      run: chmod +x dist/blog-backend
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile.prebuilt
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository }}:latest
+          ghcr.io/${{ github.repository }}:${{ github.sha }}

@@ -1,0 +1,51 @@
+# Build stage with Debian 12 (matching distroless glibc version)
+FROM python:3.11-slim-bookworm as builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    patchelf \
+    ccache \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy source files
+COPY pyproject.toml ./
+COPY blog_backend ./blog_backend
+COPY run.py ./
+
+# Install dependencies and build
+RUN pip install uv
+RUN uv venv && . .venv/bin/activate && uv pip install -e . nuitka
+
+# Build with Nuitka - static linking where possible
+RUN . .venv/bin/activate && python -m nuitka \
+    --standalone \
+    --onefile \
+    --assume-yes-for-downloads \
+    --output-dir=dist \
+    --output-filename=blog-backend \
+    --include-package=blog_backend \
+    --include-package=fastapi \
+    --include-package=uvicorn \
+    --include-package=frontmatter \
+    --include-package=markdown \
+    --include-package=pydantic \
+    --enable-plugin=anti-bloat \
+    --static-libpython=yes \
+    --show-progress \
+    run.py
+
+# Final distroless stage
+FROM gcr.io/distroless/cc-debian12
+
+COPY --from=builder /app/dist/blog-backend /app/blog-backend
+
+ENV HOST=0.0.0.0
+ENV PORT=8000
+ENV POSTS_DIRECTORY=/posts
+
+EXPOSE 8000
+
+ENTRYPOINT ["/app/blog-backend"]

@@ -1,0 +1,16 @@
+# Use pre-built Nuitka binary - much faster!
+FROM gcr.io/distroless/cc-debian12
+
+# Copy the pre-built binary from your local dist folder
+COPY dist/blog-backend /app/blog-backend
+
+# Set environment variables
+ENV HOST=0.0.0.0
+ENV PORT=8000
+ENV POSTS_DIRECTORY=/posts
+
+# Expose port
+EXPOSE 8000
+
+# Run the binary
+ENTRYPOINT ["/app/blog-backend"]

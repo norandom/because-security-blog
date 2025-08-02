@@ -16,7 +16,24 @@ A FastAPI-based blog backend that reads markdown files with frontmatter, optimiz
 
 ## Quick Start
 
-### Development
+### Use Pre-built Binary (Recommended)
+
+Download the latest binary from GitHub:
+
+```bash
+# Download from latest release
+curl -L https://github.com/norandom/because-security-blog/releases/latest/download/blog-backend -o blog-backend
+chmod +x blog-backend
+./blog-backend
+```
+
+### Use Docker Image
+
+```bash
+docker run -p 8000:8000 -v $(pwd)/posts:/posts:ro ghcr.io/norandom/because-security-blog:latest
+```
+
+## Development
 
 ```bash
 # Create virtual environment with uv

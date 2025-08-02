@@ -56,7 +56,9 @@ jobs:
     - name: Test binary compatibility
       run: |
         ldd dist/blog-backend || echo "Binary is statically linked"
-        file dist/blog-backend
+        ls -la dist/blog-backend
+        # Show glibc version requirement
+        strings dist/blog-backend | grep GLIBC | sort -u | tail -5
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4

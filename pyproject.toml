@@ -9,6 +9,9 @@ dependencies = [
     "python-multipart>=0.0.6",
     "pydantic>=2.5.0",
     "markdown>=3.5.1",
+    "beautifulsoup4>=4.13.4",
+    "html2text>=2025.4.15",
+    "requests>=2.32.4",
 ]
 
 [build-system]

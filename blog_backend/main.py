@@ -10,13 +10,29 @@ from collections import Counter
 import os
 import asyncio
 
-from .models import BlogPost, BlogPostSummary, BlogStats
+from .models import BlogPost, BlogPostSummary, BlogStats, TenantStats, TenantType
 from .functional_blog_parser import FunctionalBlogParser
 from .functional_types import compose, filter_list, sort_list, map_list
 
 app = FastAPI(
     title="Blog Backend API",
-    description="A FastAPI backend using functional programming patterns with concurrent processing and Nuitka compilation support",
+    description="""
+    A FastAPI backend using functional programming patterns with concurrent processing and Nuitka compilation support.
+    
+    ## Features
+    
+    * **Multi-Tenant**: Separate content streams for InfoSec and Quant research
+    * **Functional Programming**: Pure functions, immutable data, Result/Either types
+    * **Concurrent Processing**: Async I/O with ThreadPoolExecutor for performance
+    * **Type Safety**: Full type annotations with union types and pattern matching
+    * **Nuitka Optimized**: Compiles to native binary for production deployment
+    
+    ## Tenants
+    
+    * **infosec**: Information Security research, threat analysis, defensive strategies
+    * **quant**: Quantitative Finance, algorithmic trading, market analysis  
+    * **shared**: General updates and cross-domain content
+    """,
     version="2.0.0",
     contact={
         "name": "Blog API Support",
@@ -46,6 +62,10 @@ app = FastAPI(
             "name": "admin",
             "description": "Administrative operations",
         },
+        {
+            "name": "tenants",
+            "description": "Multi-tenant operations for infosec and quant content",
+        },
     ],
 )
 
@@ -72,6 +92,10 @@ def create_tag_filter(tag: str) -> callable:
 def create_author_filter(author: str) -> callable:
     """Pure function to create author filter"""
     return lambda posts: [post for post in posts if post.author and post.author.lower() == author.lower()]
+
+def create_tenant_filter(tenant: TenantType) -> callable:
+    """Pure function to create tenant filter"""
+    return lambda posts: [post for post in posts if post.tenant == tenant]
 
 def create_date_sorter(reverse: bool = True) -> callable:
     """Pure function to create date sorter"""
@@ -102,6 +126,7 @@ def posts_to_summaries(posts: List[BlogPost]) -> List[BlogPostSummary]:
             tags=post.tags,
             date=post.date,
             author=post.author,
+            tenant=post.tenant,
             reading_time=post.reading_time
         )
         for post in posts
@@ -126,11 +151,51 @@ def calculate_blog_stats(posts: List[BlogPost]) -> BlogStats:
         month_key = post.date.strftime("%Y-%m")
         posts_by_month[month_key] += 1
     
+    # Count posts by tenant
+    posts_by_tenant = Counter()
+    for post in posts:
+        posts_by_tenant[post.tenant] += 1
+    
     return BlogStats(
         total_posts=len(posts),
         tags=dict(tag_counter),
         authors=dict(author_counter),
-        posts_by_month=dict(posts_by_month)
+        posts_by_month=dict(posts_by_month),
+        posts_by_tenant=dict(posts_by_tenant)
+    )
+
+def calculate_tenant_stats(posts: List[BlogPost], tenant: TenantType) -> TenantStats:
+    """Pure function to calculate tenant-specific statistics"""
+    tenant_posts = [post for post in posts if post.tenant == tenant]
+    
+    # Count tags for this tenant
+    tag_counter = Counter()
+    for post in tenant_posts:
+        tag_counter.update(post.tags)
+    
+    # Count authors for this tenant
+    author_counter = Counter()
+    for post in tenant_posts:
+        if post.author:
+            author_counter[post.author] += 1
+    
+    # Count posts by month for this tenant
+    posts_by_month = Counter()
+    for post in tenant_posts:
+        month_key = post.date.strftime("%Y-%m")
+        posts_by_month[month_key] += 1
+    
+    # Get recent posts (last 5)
+    recent_posts = sorted(tenant_posts, key=lambda p: p.date, reverse=True)[:5]
+    recent_summaries = posts_to_summaries(recent_posts)
+    
+    return TenantStats(
+        tenant=tenant,
+        total_posts=len(tenant_posts),
+        tags=dict(tag_counter),
+        authors=dict(author_counter),
+        posts_by_month=dict(posts_by_month),
+        recent_posts=recent_summaries
     )
 
 # API Endpoints using functional patterns
@@ -157,6 +222,7 @@ async def list_posts(
     order: Optional[str] = Query("desc", regex="^(asc|desc)$", description="Sort order"),
     tag: Optional[str] = Query(None, description="Filter by tag"),
     author: Optional[str] = Query(None, description="Filter by author"),
+    tenant: Optional[TenantType] = Query(None, description="Filter by tenant (infosec, quant, shared)"),
     limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum number of posts to return"),
     offset: Optional[int] = Query(0, ge=0, description="Number of posts to skip")
 ):
@@ -169,6 +235,9 @@ async def list_posts(
     
     if author:
         transformations.append(create_author_filter(author))
+    
+    if tenant:
+        transformations.append(create_tenant_filter(tenant))
     
     # Add sorting
     reverse = order == "desc"
@@ -344,6 +413,109 @@ async def refresh_posts():
             }
 
 # Health check endpoint
+# Tenant-specific endpoints
+@app.get(
+    "/tenants",
+    tags=["tenants"],
+    summary="List Tenants",
+    description="Get list of available tenants",
+    response_description="List of available tenants with descriptions"
+)
+async def list_tenants():
+    return [
+        {"tenant": "infosec", "name": "Information Security", "description": "Security research, threat analysis, and defensive strategies"},
+        {"tenant": "quant", "name": "Quantitative Finance", "description": "Algorithmic trading, market analysis, and quantitative research"},
+        {"tenant": "shared", "name": "Shared Content", "description": "General updates and cross-domain content"}
+    ]
+
+@app.get(
+    "/tenants/{tenant}",
+    response_model=TenantStats,
+    tags=["tenants"],
+    summary="Get Tenant Statistics",
+    description="""
+    Get comprehensive statistics for a specific tenant including:
+    - Total post count for the tenant
+    - Tag usage statistics
+    - Author contributions
+    - Posts by month timeline
+    - Recent posts (last 5)
+    
+    Perfect for dashboard widgets and tenant overview pages.
+    """,
+    response_description="Tenant-specific statistics including recent posts"
+)
+async def get_tenant_stats(tenant: TenantType):
+    posts = await blog_parser.get_all_posts()
+    return calculate_tenant_stats(posts, tenant)
+
+@app.get(
+    "/tenants/{tenant}/posts",
+    response_model=List[BlogPostSummary],
+    tags=["tenants"],
+    summary="Get Posts by Tenant",
+    description="Get posts for a specific tenant with sorting and pagination",
+    response_description="List of posts for the specified tenant"
+)
+async def get_tenant_posts(
+    tenant: TenantType,
+    limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum number of posts to return"),
+    offset: Optional[int] = Query(0, ge=0, description="Number of posts to skip"),
+    sort_by: Optional[str] = Query("date", regex="^(date|title|author)$", description="Field to sort by"),
+    order: Optional[str] = Query("desc", regex="^(asc|desc)$", description="Sort order")
+):
+    posts = await blog_parser.filter_by_tenant(tenant)
+    
+    # Apply sorting
+    reverse = order == "desc"
+    if sort_by == "date":
+        posts = sorted(posts, key=lambda p: p.date, reverse=reverse)
+    elif sort_by == "title":
+        posts = sorted(posts, key=lambda p: p.title.lower(), reverse=reverse)
+    elif sort_by == "author":
+        posts = sorted(posts, key=lambda p: (p.author or "").lower(), reverse=reverse)
+    
+    # Apply pagination
+    if offset > 0:
+        posts = posts[offset:]
+    if limit:
+        posts = posts[:limit]
+    
+    return posts_to_summaries(posts)
+
+@app.get(
+    "/tenants/{tenant}/recent",
+    response_model=List[BlogPostSummary],
+    tags=["tenants"],
+    summary="Get Recent Posts by Tenant",
+    description="Get recent posts for a specific tenant",
+    response_description="Recent posts for the specified tenant"
+)
+async def get_tenant_recent_posts(
+    tenant: TenantType,
+    limit: int = Query(5, ge=1, le=20, description="Number of recent posts to return")
+):
+    return await blog_parser.get_recent_by_tenant(tenant, limit)
+
+@app.get(
+    "/tenants/{tenant}/tags",
+    tags=["tenants"],
+    summary="Get Tags by Tenant",
+    description="Get all tags used by posts in a specific tenant",
+    response_description="List of tags with counts for the specified tenant"
+)
+async def get_tenant_tags(tenant: TenantType):
+    posts = await blog_parser.filter_by_tenant(tenant)
+    
+    # Functional approach to count tags for this tenant
+    tag_counts = compose(
+        lambda posts: [tag for post in posts for tag in post.tags],  # Flatten tags
+        lambda tags: Counter(tags),  # Count occurrences
+        lambda counter: [{"tag": tag, "count": count} for tag, count in counter.most_common()]
+    )(posts)
+    
+    return tag_counts
+
 @app.get(
     "/health",
     tags=["admin"],
@@ -353,9 +525,12 @@ async def refresh_posts():
 async def health_check():
     try:
         posts = await blog_parser.get_all_posts()
+        tenant_counts = Counter(post.tenant for post in posts)
+        
         return {
             "status": "healthy",
             "posts_loaded": len(posts),
+            "tenants": dict(tenant_counts),
             "functional_parser": True,
             "concurrent_processing": True,
             "max_workers": blog_parser.max_workers

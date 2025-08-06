@@ -10,7 +10,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import re
 
-from .models import BlogPost, BlogPostSummary
+from .models import BlogPost, BlogPostSummary, TenantType
 from .functional_types import (
     Result, Success, Failure, ParseError,
     map_result, flat_map, pipe, compose,
@@ -74,6 +74,11 @@ def create_blog_post_pure(
         title = metadata.get('title', slug.replace('-', ' ').title())
         tags = safe_parse_tags(metadata.get('tags', []))
         author = metadata.get('author')
+        tenant = metadata.get('tenant', 'shared')
+        
+        # Validate tenant
+        if tenant not in ['infosec', 'quant', 'shared']:
+            tenant = 'shared'
         
         # Parse date
         date_result = safe_parse_date(metadata.get('date'))
@@ -103,6 +108,7 @@ def create_blog_post_pure(
             tags=tags,
             date=date,
             author=author,
+            tenant=tenant,
             metadata=metadata,
             attachments=attachments,
             reading_time=reading_time
@@ -225,6 +231,7 @@ class FunctionalBlogParser:
             tags=post.tags,
             date=post.date,
             author=post.author,
+            tenant=post.tenant,
             reading_time=post.reading_time
         )
         
@@ -291,6 +298,37 @@ class FunctionalBlogParser:
             pipeline_functions.append(take(limit))
         
         return compose(*pipeline_functions)(posts)
+    
+    async def filter_by_tenant(self, tenant: TenantType, limit: Optional[int] = None) -> List[BlogPost]:
+        """Filter posts by tenant using functional approach"""
+        posts = await self.get_all_posts()
+        
+        pipeline_functions = [
+            filter_list(lambda post: post.tenant == tenant),
+            sort_list(lambda post: post.date, reverse=True)
+        ]
+        
+        if limit:
+            pipeline_functions.append(take(limit))
+        
+        return compose(*pipeline_functions)(posts)
+    
+    async def get_recent_by_tenant(self, tenant: TenantType, limit: int = 5) -> List[BlogPostSummary]:
+        """Get recent posts for a specific tenant"""
+        posts = await self.filter_by_tenant(tenant, limit)
+        
+        to_summary = lambda post: BlogPostSummary(
+            slug=post.slug,
+            title=post.title,
+            excerpt=post.excerpt,
+            tags=post.tags,
+            date=post.date,
+            author=post.author,
+            tenant=post.tenant,
+            reading_time=post.reading_time
+        )
+        
+        return [to_summary(post) for post in posts]
     
     async def get_posts_with_transformations(
         self,

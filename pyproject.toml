@@ -12,6 +12,7 @@ dependencies = [
     "beautifulsoup4>=4.13.4",
     "html2text>=2025.4.15",
     "requests>=2.32.4",
+    "pydantic-settings>=2.10.1",
 ]
 
 [build-system]

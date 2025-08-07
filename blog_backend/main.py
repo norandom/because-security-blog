@@ -1,21 +1,32 @@
 """
-Functional FastAPI backend with concurrent processing
+Functional FastAPI backend with concurrent processing and enhanced features
 """
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from collections import Counter
 import os
 import asyncio
+import uuid
+import time
 
 from .models import BlogPost, BlogPostSummary, BlogStats, TenantStats, TenantType
 from .functional_blog_parser import FunctionalBlogParser
 from .functional_types import compose, filter_list, sort_list, map_list
+from .config import get_settings, get_security_settings
+from .logging import logger, metrics, request_tracker, request_id_var
+from .cache import StatsCache, cached
+from .search import SearchEngine
+from .rate_limit import EndpointRateLimiter
+
+# Get configuration
+settings = get_settings()
+security_settings = get_security_settings()
 
 app = FastAPI(
-    title="Blog Backend API",
+    title=settings.app_name,
     description="""
     A FastAPI backend using functional programming patterns with concurrent processing and Nuitka compilation support.
     
@@ -26,6 +37,10 @@ app = FastAPI(
     * **Concurrent Processing**: Async I/O with ThreadPoolExecutor for performance
     * **Type Safety**: Full type annotations with union types and pattern matching
     * **Nuitka Optimized**: Compiles to native binary for production deployment
+    * **Enhanced Search**: In-memory indexing with ranking and suggestions
+    * **Rate Limiting**: Per-endpoint rate limiting with token bucket algorithm
+    * **Observability**: Structured logging and metrics collection
+    * **Caching**: Intelligent caching with TTL for performance
     
     ## Tenants
     
@@ -33,7 +48,7 @@ app = FastAPI(
     * **quant**: Quantitative Finance, algorithmic trading, market analysis  
     * **shared**: General updates and cross-domain content
     """,
-    version="2.0.0",
+    version=settings.app_version,
     contact={
         "name": "Blog API Support",
         "url": "https://github.com/norandom/because-security-blog",
@@ -69,20 +84,107 @@ app = FastAPI(
     ],
 )
 
-# Initialize functional blog parser with concurrency
+# Initialize global components
 blog_parser = FunctionalBlogParser(
-    posts_directory=os.getenv("POSTS_DIRECTORY", "posts"),
-    max_workers=int(os.getenv("MAX_WORKERS", "4"))
+    posts_directory=str(settings.posts_directory),
+    max_workers=settings.max_workers
 )
+search_engine = SearchEngine()
+stats_cache = StatsCache()
+rate_limiter = EndpointRateLimiter()
 
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this based on your Svelte frontend URL
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Request tracking middleware
+@app.middleware("http")
+async def track_requests(request: Request, call_next):
+    """Track request performance and add request ID"""
+    request_id = str(uuid.uuid4())
+    request_id_var.set(request_id)
+    
+    start_time = time.time()
+    path = request.url.path
+    method = request.method
+    
+    # Check rate limiting
+    if settings.rate_limit_enabled:
+        client_ip = request.client.host if request.client else "unknown"
+        allowed, limit_info = await rate_limiter.check_endpoint_limit(path, client_ip)
+        
+        if not allowed:
+            await metrics.increment("http_requests_rate_limited_total")
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": "Rate limit exceeded",
+                    "reason": limit_info.get("reason"),
+                    "retry_after": limit_info.get("retry_after")
+                },
+                headers={"Retry-After": str(int(limit_info.get("retry_after", 60)))}
+            )
+    
+    await request_tracker.start_request(request_id, path, method)
+    
+    try:
+        response = await call_next(request)
+        duration = time.time() - start_time
+        
+        await request_tracker.end_request(
+            request_id, path, method, response.status_code, duration
+        )
+        
+        # Add request ID to response headers
+        response.headers["X-Request-ID"] = request_id
+        
+        return response
+        
+    except Exception as e:
+        duration = time.time() - start_time
+        await request_tracker.end_request(request_id, path, method, 500, duration)
+        await metrics.increment("http_requests_errors_total")
+        logger.error("Request failed", 
+                    request_id=request_id, 
+                    error=str(e), 
+                    path=path, 
+                    method=method)
+        raise
+
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application components"""
+    logger.info("Starting Blog Backend API", version=settings.app_version)
+    
+    # Start rate limiter cleanup tasks
+    if settings.rate_limit_enabled:
+        await rate_limiter.start_all_cleanup_tasks()
+    
+    # Initialize search index
+    posts = await blog_parser.get_all_posts()
+    await search_engine.rebuild_index(posts)
+    
+    logger.info("Application started", 
+                posts_loaded=len(posts),
+                search_index_ready=True,
+                rate_limiting=settings.rate_limit_enabled)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    logger.info("Shutting down Blog Backend API")
+    
+    # Stop rate limiter cleanup tasks
+    if settings.rate_limit_enabled:
+        await rate_limiter.stop_all_cleanup_tasks()
+    
+    logger.info("Application shutdown complete")
 
 # Pure functions for API logic
 def create_tag_filter(tag: str) -> callable:
@@ -277,32 +379,58 @@ async def get_post(slug: str):
     "/search", 
     response_model=List[BlogPostSummary],
     tags=["search"],
-    summary="Search Posts (Functional)",
-    description="Search blog posts using functional composition",
-    response_description="List of matching blog post summaries"
+    summary="Enhanced Search",
+    description="Search blog posts using advanced indexing with ranking and relevance scoring",
+    response_description="List of matching blog post summaries ranked by relevance"
 )
 async def search_posts(
-    q: str = Query(..., min_length=1, description="Search query"),
-    limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum number of results")
+    q: str = Query(..., min_length=settings.search_min_length, max_length=security_settings.max_query_length, description="Search query"),
+    tenant: Optional[TenantType] = Query(None, description="Filter by tenant"),
+    limit: Optional[int] = Query(None, ge=1, le=settings.search_max_results, description="Maximum number of results")
 ):
-    results = await blog_parser.search_posts(q)
+    # Validate query length
+    if len(q.strip()) < settings.search_min_length:
+        raise HTTPException(status_code=400, detail="Query too short")
     
-    if limit:
-        results = results[:limit]
+    # Use enhanced search engine
+    search_results = await search_engine.search(
+        query=q.strip(),
+        tenant=tenant,
+        limit=limit or 20
+    )
     
-    return posts_to_summaries(results)
+    # Get full post data for results
+    posts = await blog_parser.get_all_posts()
+    post_dict = {post.slug: post for post in posts}
+    
+    # Convert search results to summaries
+    result_posts = []
+    for slug, score in search_results:
+        if slug in post_dict:
+            result_posts.append(post_dict[slug])
+    
+    await metrics.increment("search_queries_total", labels={"tenant": tenant or "all"})
+    logger.info("Search performed", query=q, tenant=tenant, results_count=len(result_posts))
+    
+    return posts_to_summaries(result_posts)
 
 @app.get(
     "/stats", 
     response_model=BlogStats,
     tags=["stats"],
-    summary="Get Blog Statistics (Functional)",
-    description="Get comprehensive blog statistics using pure functions",
+    summary="Get Blog Statistics (Cached)",
+    description="Get comprehensive blog statistics using pure functions with intelligent caching",
     response_description="Blog statistics and analytics"
 )
+@cached(ttl=settings.stats_cache_ttl)
 async def get_stats():
-    posts = await blog_parser.get_all_posts()
-    return calculate_blog_stats(posts)
+    async def compute_stats():
+        posts = await blog_parser.get_all_posts()
+        # Rebuild search index if needed
+        await search_engine.rebuild_index(posts)
+        return calculate_blog_stats(posts)
+    
+    return await stats_cache.get_stats(compute_stats)
 
 @app.get(
     "/tags",
@@ -516,29 +644,96 @@ async def get_tenant_tags(tenant: TenantType):
     
     return tag_counts
 
+# New enhanced endpoints
+@app.get(
+    "/search/suggest",
+    tags=["search"],
+    summary="Search Suggestions",
+    description="Get auto-complete suggestions for search queries",
+    response_description="List of suggested search terms"
+)
+async def search_suggest(
+    q: str = Query(..., min_length=1, max_length=50, description="Search prefix"),
+    limit: int = Query(5, ge=1, le=10, description="Maximum number of suggestions")
+):
+    suggestions = await search_engine.suggest(q, limit)
+    return {"suggestions": suggestions}
+
+@app.get(
+    "/posts/{slug}/related",
+    response_model=List[BlogPostSummary],
+    tags=["posts"],
+    summary="Related Posts",
+    description="Find posts related to the given post",
+    response_description="List of related post summaries"
+)
+async def get_related_posts(slug: str, limit: int = Query(5, ge=1, le=10)):
+    post = await blog_parser.get_post(slug)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    related_slugs = await search_engine.get_related_posts(slug, limit)
+    
+    # Get post data for related posts
+    posts = await blog_parser.get_all_posts()
+    post_dict = {p.slug: p for p in posts}
+    
+    related_posts = [post_dict[s] for s in related_slugs if s in post_dict]
+    return posts_to_summaries(related_posts)
+
+@app.get(
+    "/metrics",
+    tags=["admin"],
+    summary="Application Metrics",
+    description="Get application performance metrics",
+    response_description="Performance and usage metrics"
+)
+async def get_metrics():
+    metrics_summary = await metrics.get_summary()
+    search_stats = await search_engine.get_stats()
+    
+    return {
+        "performance": metrics_summary,
+        "search_index": search_stats,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
 @app.get(
     "/health",
     tags=["admin"],
-    summary="Health Check",
-    description="Check API health and functional parser status"
+    summary="Enhanced Health Check",
+    description="Comprehensive health check with dependency verification"
 )
 async def health_check():
     try:
         posts = await blog_parser.get_all_posts()
         tenant_counts = Counter(post.tenant for post in posts)
+        search_stats = await search_engine.get_stats()
+        
+        # Check if minimum posts threshold is met
+        posts_healthy = len(posts) >= settings.health_check_posts_threshold
+        search_healthy = search_stats.get("total_posts", 0) > 0
+        
+        status = "healthy" if posts_healthy and search_healthy else "degraded"
         
         return {
-            "status": "healthy",
+            "status": status,
             "posts_loaded": len(posts),
             "tenants": dict(tenant_counts),
+            "search_index": search_stats,
             "functional_parser": True,
             "concurrent_processing": True,
-            "max_workers": blog_parser.max_workers
+            "max_workers": blog_parser.max_workers,
+            "rate_limiting": settings.rate_limit_enabled,
+            "caching_enabled": True,
+            "version": settings.app_version
         }
     except Exception as e:
+        logger.error("Health check failed", error=str(e))
         return {
             "status": "unhealthy",
             "error": str(e),
             "functional_parser": True,
-            "concurrent_processing": True
+            "concurrent_processing": True,
+            "version": settings.app_version
         }

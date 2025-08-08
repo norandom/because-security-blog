@@ -22,7 +22,7 @@ class PostRepository(Protocol):
     async def get_all_posts(self) -> List[BlogPost]:
         ...
     
-    async def get_post_by_slug(self, slug: str) -> Optional[BlogPost]:
+    async def get_post(self, slug: str) -> Optional[BlogPost]:
         ...
     
     async def filter_by_tenant(self, tenant: TenantType) -> List[BlogPost]:
@@ -127,7 +127,7 @@ class PostService:
     async def get_post(self, slug: str) -> BlogPost:
         """Get a single post by slug"""
         try:
-            post = await self.repository.get_post_by_slug(slug)
+            post = await self.repository.get_post(slug)
             if not post:
                 raise PostNotFoundError(slug)
             

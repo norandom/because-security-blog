@@ -2,8 +2,9 @@
 author: Marius Ciepluch
 date: '2025-08-06T17:58:24.673874'
 original_url: https://www.because-security.com/blog/advanced-practitioners-guide-to-byte-level-transformation-dec-2024
-reading_time: 15
-tags: []
+reading_time: 25
+tenant: infosec
+tags: [machine learning, chunking]
 title: Early check on Byte Latent Transformation (Dec 2024)
 ---
 

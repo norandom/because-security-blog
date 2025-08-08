@@ -12,12 +12,13 @@ class BlogSettings(BaseSettings):
     
     # Application settings
     app_name: str = Field(default="Blog Backend API", env="APP_NAME")
-    app_version: str = Field(default="2.0.0", env="APP_VERSION")
+    app_version: str = Field(default="2.1.0", env="APP_VERSION")
     debug: bool = Field(default=False, env="DEBUG")
     
     # API settings
     api_prefix: str = Field(default="", env="API_PREFIX")
     cors_origins: List[str] = Field(default=["*"], env="CORS_ORIGINS")
+    allowed_hosts: List[str] = Field(default=[], env="ALLOWED_HOSTS")
     
     # Content settings
     posts_directory: Path = Field(default=Path("posts"), env="POSTS_DIRECTORY")

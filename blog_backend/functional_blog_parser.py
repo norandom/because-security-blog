@@ -75,6 +75,7 @@ def create_blog_post_pure(
         tags = safe_parse_tags(metadata.get('tags', []))
         author = metadata.get('author')
         tenant = metadata.get('tenant', 'shared')
+        sticky = metadata.get('sticky', False)
         
         # Validate tenant
         if tenant not in ['infosec', 'quant', 'shared']:
@@ -109,6 +110,7 @@ def create_blog_post_pure(
             date=date,
             author=author,
             tenant=tenant,
+            sticky=sticky,
             metadata=metadata,
             attachments=attachments,
             reading_time=reading_time
@@ -232,6 +234,7 @@ class FunctionalBlogParser:
             date=post.date,
             author=post.author,
             tenant=post.tenant,
+            sticky=post.sticky,
             reading_time=post.reading_time
         )
         
@@ -325,6 +328,7 @@ class FunctionalBlogParser:
             date=post.date,
             author=post.author,
             tenant=post.tenant,
+            sticky=post.sticky,
             reading_time=post.reading_time
         )
         

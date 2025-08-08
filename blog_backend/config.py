@@ -29,6 +29,7 @@ class BlogSettings(BaseSettings):
     
     # Performance settings
     max_workers: int = Field(default=4, env="MAX_WORKERS")
+    cache_enabled: bool = Field(default=True, env="CACHE_ENABLED")
     cache_ttl: int = Field(default=300, env="CACHE_TTL")  # 5 minutes
     stats_cache_ttl: int = Field(default=300, env="STATS_CACHE_TTL")
     

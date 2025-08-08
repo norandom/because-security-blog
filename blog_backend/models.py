@@ -16,6 +16,7 @@ class BlogPost(BaseModel):
     date: datetime = Field(..., description="Publication date and time")
     author: Optional[str] = Field(None, description="Post author name")
     tenant: TenantType = Field(default="shared", description="Tenant namespace (infosec, quant, or shared)")
+    sticky: bool = Field(default=False, description="Whether this post should appear at the top of lists")
     metadata: Dict[str, Any] = Field(default={}, description="Additional metadata from frontmatter")
     attachments: List[str] = Field(default=[], description="List of attachment file paths")
     reading_time: Optional[int] = Field(None, description="Estimated reading time in minutes")
@@ -30,6 +31,7 @@ class BlogPostSummary(BaseModel):
     date: datetime = Field(..., description="Publication date and time")
     author: Optional[str] = Field(None, description="Post author name")
     tenant: TenantType = Field(default="shared", description="Tenant namespace (infosec, quant, or shared)")
+    sticky: bool = Field(default=False, description="Whether this post should appear at the top of lists")
     reading_time: Optional[int] = Field(None, description="Estimated reading time in minutes")
 
 

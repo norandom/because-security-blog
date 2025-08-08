@@ -3,6 +3,7 @@ title: Advanced Threat Modeling Techniques
 date: 2025-08-06T14:00:00Z
 author: InfoSec Team
 tenant: infosec
+sticky: true
 tags: [threat-modeling, security-analysis, risk-assessment]
 excerpt: Deep dive into modern threat modeling methodologies for complex enterprise environments.
 ---

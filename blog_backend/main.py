@@ -20,6 +20,7 @@ from .logging import logger, metrics, request_tracker, request_id_var
 from .cache import StatsCache, cached
 from .search import SearchEngine
 from .rate_limit import EndpointRateLimiter
+from .sticky import apply_sticky_sorting, posts_to_summaries_with_sticky
 
 # Get configuration
 settings = get_settings()
@@ -229,6 +230,7 @@ def posts_to_summaries(posts: List[BlogPost]) -> List[BlogPostSummary]:
             date=post.date,
             author=post.author,
             tenant=post.tenant,
+            sticky=post.sticky,
             reading_time=post.reading_time
         )
         for post in posts
@@ -316,7 +318,7 @@ async def root():
     response_model=List[BlogPostSummary],
     tags=["posts"],
     summary="List Blog Posts",
-    description="Get a paginated list of blog post summaries using functional transformations and concurrent processing",
+    description="Get a paginated list of blog post summaries with optional sticky post prioritization",
     response_description="List of blog post summaries"
 )
 async def list_posts(
@@ -325,39 +327,48 @@ async def list_posts(
     tag: Optional[str] = Query(None, description="Filter by tag"),
     author: Optional[str] = Query(None, description="Filter by author"),
     tenant: Optional[TenantType] = Query(None, description="Filter by tenant (infosec, quant, shared)"),
+    enable_sticky: bool = Query(True, description="Enable sticky posts (appear at top when 3+ posts)"),
     limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum number of posts to return"),
     offset: Optional[int] = Query(0, ge=0, description="Number of posts to skip")
 ):
-    # Build functional transformation pipeline
-    transformations = []
-    
-    # Add filters
-    if tag:
-        transformations.append(create_tag_filter(tag))
-    
-    if author:
-        transformations.append(create_author_filter(author))
-    
-    if tenant:
-        transformations.append(create_tenant_filter(tenant))
-    
-    # Add sorting
-    reverse = order == "desc"
-    if sort_by == "date":
-        transformations.append(create_date_sorter(reverse))
-    elif sort_by == "title":
-        transformations.append(create_title_sorter(reverse))
-    elif sort_by == "author":
-        transformations.append(create_author_sorter(reverse))
-    
-    # Add pagination
-    transformations.append(apply_pagination(offset, limit))
-    
-    # Get posts and apply transformations
+    # Get all posts
     posts = await blog_parser.get_all_posts()
     
-    # Apply functional pipeline
-    filtered_posts = compose(*transformations)(posts) if transformations else posts
+    # Apply filters
+    filtered_posts = posts
+    if tag:
+        filtered_posts = create_tag_filter(tag)(filtered_posts)
+    
+    if author:
+        filtered_posts = create_author_filter(author)(filtered_posts)
+    
+    if tenant:
+        filtered_posts = create_tenant_filter(tenant)(filtered_posts)
+    
+    # Apply sorting (with sticky support for date sorting)
+    reverse = order == "desc"
+    if sort_by == "date":
+        if enable_sticky:
+            # Use sticky-aware sorting
+            filtered_posts = apply_sticky_sorting(filtered_posts, enable_sticky, min_posts_for_sticky=3)
+            # If reversed order for non-sticky, we need to reverse the regular posts only
+            if not reverse:
+                sticky_posts = [p for p in filtered_posts if p.sticky]
+                regular_posts = [p for p in filtered_posts if not p.sticky]
+                regular_posts.sort(key=lambda p: p.date, reverse=False)  # Ascending
+                filtered_posts = sticky_posts + regular_posts
+        else:
+            filtered_posts = create_date_sorter(reverse)(filtered_posts)
+    elif sort_by == "title":
+        filtered_posts = create_title_sorter(reverse)(filtered_posts)
+    elif sort_by == "author":
+        filtered_posts = create_author_sorter(reverse)(filtered_posts)
+    
+    # Apply pagination
+    if offset > 0:
+        filtered_posts = filtered_posts[offset:]
+    if limit:
+        filtered_posts = filtered_posts[:limit]
     
     return posts_to_summaries(filtered_posts)
 
@@ -418,11 +429,10 @@ async def search_posts(
     "/stats", 
     response_model=BlogStats,
     tags=["stats"],
-    summary="Get Blog Statistics (Cached)",
-    description="Get comprehensive blog statistics using pure functions with intelligent caching",
+    summary="Get Blog Statistics",
+    description="Get comprehensive blog statistics using pure functions with optional caching",
     response_description="Blog statistics and analytics"
 )
-@cached(ttl=settings.stats_cache_ttl)
 async def get_stats():
     async def compute_stats():
         posts = await blog_parser.get_all_posts()
@@ -430,7 +440,10 @@ async def get_stats():
         await search_engine.rebuild_index(posts)
         return calculate_blog_stats(posts)
     
-    return await stats_cache.get_stats(compute_stats)
+    if settings.cache_enabled:
+        return await stats_cache.get_stats(compute_stats)
+    else:
+        return await compute_stats()
 
 @app.get(
     "/tags",
@@ -582,7 +595,7 @@ async def get_tenant_stats(tenant: TenantType):
     response_model=List[BlogPostSummary],
     tags=["tenants"],
     summary="Get Posts by Tenant",
-    description="Get posts for a specific tenant with sorting and pagination",
+    description="Get posts for a specific tenant with sorting, pagination, and sticky post support",
     response_description="List of posts for the specified tenant"
 )
 async def get_tenant_posts(
@@ -590,14 +603,25 @@ async def get_tenant_posts(
     limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum number of posts to return"),
     offset: Optional[int] = Query(0, ge=0, description="Number of posts to skip"),
     sort_by: Optional[str] = Query("date", regex="^(date|title|author)$", description="Field to sort by"),
-    order: Optional[str] = Query("desc", regex="^(asc|desc)$", description="Sort order")
+    order: Optional[str] = Query("desc", regex="^(asc|desc)$", description="Sort order"),
+    enable_sticky: bool = Query(True, description="Enable sticky posts (appear at top when 3+ posts)")
 ):
     posts = await blog_parser.filter_by_tenant(tenant)
     
-    # Apply sorting
+    # Apply sorting (with sticky support for date sorting)
     reverse = order == "desc"
     if sort_by == "date":
-        posts = sorted(posts, key=lambda p: p.date, reverse=reverse)
+        if enable_sticky:
+            # Use sticky-aware sorting
+            posts = apply_sticky_sorting(posts, enable_sticky, min_posts_for_sticky=3)
+            # If reversed order for non-sticky, we need to reverse the regular posts only
+            if not reverse:
+                sticky_posts = [p for p in posts if p.sticky]
+                regular_posts = [p for p in posts if not p.sticky]
+                regular_posts.sort(key=lambda p: p.date, reverse=False)  # Ascending
+                posts = sticky_posts + regular_posts
+        else:
+            posts = sorted(posts, key=lambda p: p.date, reverse=reverse)
     elif sort_by == "title":
         posts = sorted(posts, key=lambda p: p.title.lower(), reverse=reverse)
     elif sort_by == "author":
@@ -643,6 +667,62 @@ async def get_tenant_tags(tenant: TenantType):
     )(posts)
     
     return tag_counts
+
+@app.get(
+    "/posts/all-tenants",
+    response_model=List[BlogPostSummary],
+    tags=["posts"],
+    summary="List All Posts Across Tenants",
+    description="Get posts from all tenants with optional sticky post prioritization and filtering",
+    response_description="List of blog post summaries from all tenants"
+)
+async def list_all_tenant_posts(
+    sort_by: Optional[str] = Query("date", regex="^(date|title|author)$", description="Field to sort by"),
+    order: Optional[str] = Query("desc", regex="^(asc|desc)$", description="Sort order"),
+    tag: Optional[str] = Query(None, description="Filter by tag"),
+    author: Optional[str] = Query(None, description="Filter by author"),
+    enable_sticky: bool = Query(True, description="Enable sticky posts (appear at top when 3+ posts)"),
+    limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum number of posts to return"),
+    offset: Optional[int] = Query(0, ge=0, description="Number of posts to skip")
+):
+    """Get all posts from all tenants with optional sticky prioritization"""
+    # Get all posts (from all tenants)
+    posts = await blog_parser.get_all_posts()
+    
+    # Apply filters (but not tenant filter since we want all tenants)
+    filtered_posts = posts
+    if tag:
+        filtered_posts = create_tag_filter(tag)(filtered_posts)
+    
+    if author:
+        filtered_posts = create_author_filter(author)(filtered_posts)
+    
+    # Apply sorting (with sticky support for date sorting)
+    reverse = order == "desc"
+    if sort_by == "date":
+        if enable_sticky:
+            # Use sticky-aware sorting
+            filtered_posts = apply_sticky_sorting(filtered_posts, enable_sticky, min_posts_for_sticky=3)
+            # If reversed order for non-sticky, we need to reverse the regular posts only
+            if not reverse:
+                sticky_posts = [p for p in filtered_posts if p.sticky]
+                regular_posts = [p for p in filtered_posts if not p.sticky]
+                regular_posts.sort(key=lambda p: p.date, reverse=False)  # Ascending
+                filtered_posts = sticky_posts + regular_posts
+        else:
+            filtered_posts = create_date_sorter(reverse)(filtered_posts)
+    elif sort_by == "title":
+        filtered_posts = create_title_sorter(reverse)(filtered_posts)
+    elif sort_by == "author":
+        filtered_posts = create_author_sorter(reverse)(filtered_posts)
+    
+    # Apply pagination
+    if offset > 0:
+        filtered_posts = filtered_posts[offset:]
+    if limit:
+        filtered_posts = filtered_posts[:limit]
+    
+    return posts_to_summaries(filtered_posts)
 
 # New enhanced endpoints
 @app.get(

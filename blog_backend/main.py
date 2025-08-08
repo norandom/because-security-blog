@@ -389,7 +389,7 @@ async def list_all_tenant_posts(
     """
 )
 async def get_post(
-    slug: str = Query(..., description="Unique post identifier (e.g., 'advanced-threat-hunting-2024')"),
+    slug: str,
     post_service: PostService = Depends(get_post_service)
 ):
     """Get a single blog post by slug"""
@@ -413,7 +413,7 @@ async def get_post(
     """
 )
 async def get_related_posts(
-    slug: str = Query(..., description="Slug of the source post to find related content for"),
+    slug: str,
     limit: int = Query(5, ge=1, le=10, description="Maximum number of related posts (1-10)"),
     post_service: PostService = Depends(get_post_service)
 ):
@@ -554,7 +554,7 @@ async def list_tenants():
     """
 )
 async def get_tenant_stats(
-    tenant: TenantType = Query(..., description="Tenant to analyze: infosec, quant, or shared"),
+    tenant: TenantType,
     stats_service: StatsService = Depends(get_stats_service)
 ):
     """Get tenant-specific statistics"""
@@ -577,7 +577,7 @@ async def get_tenant_stats(
     """
 )
 async def get_tenant_posts(
-    tenant: TenantType = Query(..., description="Tenant to filter by: infosec, quant, or shared"),
+    tenant: TenantType,
     sort_by: str = Query("date", regex="^(date|title|author)$", description="Sort field: date, title, or author"),
     order: str = Query("desc", regex="^(asc|desc)$", description="Sort order: desc (newest first) or asc"),
     enable_sticky: bool = Query(True, description="Enable sticky posts for this tenant"),
@@ -708,10 +708,7 @@ async def get_metrics(
     **URL format:** `/attachments/{post-slug}/{filename}`
     """
 )
-async def get_attachment(
-    slug: str = Query(..., description="Post slug that owns this attachment"),
-    path: str = Query(..., description="Relative path to the attachment file")
-):
+async def get_attachment(slug: str, path: str):
     """Serve blog post attachments"""
     container = get_container()
     post = await container.blog_parser.get_post(slug)

@@ -1,26 +1,28 @@
 """
-Functional FastAPI backend with concurrent processing and enhanced features
+Refactored FastAPI backend with clean architecture and better maintainability
 """
 from fastapi import FastAPI, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 from datetime import datetime
-from collections import Counter
-import os
-import asyncio
 import uuid
 import time
 
 from .models import BlogPost, BlogPostSummary, BlogStats, TenantStats, TenantType
-from .functional_blog_parser import FunctionalBlogParser
-from .functional_types import compose, filter_list, sort_list, map_list
 from .config import get_settings, get_security_settings
 from .logging import logger, metrics, request_tracker, request_id_var
-from .cache import StatsCache, cached
+from .dependencies import get_post_service, get_stats_service, get_search_engine, get_rate_limiter, get_container
+from .services import PostService, StatsService, PostListRequest, SearchRequest
 from .search import SearchEngine
 from .rate_limit import EndpointRateLimiter
-from .sticky import apply_sticky_sorting, posts_to_summaries_with_sticky
+from .query_builder import SortField, SortOrder
+from .exceptions import BlogBackendException, PostNotFoundError, InvalidQueryError
+from .api_models import (
+    ApiResponse, ErrorResponse, PaginatedResponse, HealthResponse, 
+    MetricsResponse, SuggestionsResponse, TenantsListResponse,
+    success_response, error_response, paginated_response
+)
 
 # Get configuration
 settings = get_settings()
@@ -29,19 +31,18 @@ security_settings = get_security_settings()
 app = FastAPI(
     title=settings.app_name,
     description="""
-    A FastAPI backend using functional programming patterns with concurrent processing and Nuitka compilation support.
+    A FastAPI backend using functional programming patterns with clean architecture.
     
     ## Features
     
+    * **Clean Architecture**: Service layer separation with dependency injection
     * **Multi-Tenant**: Separate content streams for InfoSec and Quant research
     * **Functional Programming**: Pure functions, immutable data, Result/Either types
-    * **Concurrent Processing**: Async I/O with ThreadPoolExecutor for performance
-    * **Type Safety**: Full type annotations with union types and pattern matching
-    * **Nuitka Optimized**: Compiles to native binary for production deployment
     * **Enhanced Search**: In-memory indexing with ranking and suggestions
     * **Rate Limiting**: Per-endpoint rate limiting with token bucket algorithm
     * **Observability**: Structured logging and metrics collection
-    * **Caching**: Intelligent caching with TTL for performance
+    * **Caching**: Configurable caching with TTL for performance
+    * **Type Safety**: Comprehensive type hints and validation
     
     ## Tenants
     
@@ -58,41 +59,13 @@ app = FastAPI(
         "name": "MIT",
     },
     openapi_tags=[
-        {
-            "name": "posts",
-            "description": "Operations with blog posts using functional patterns",
-        },
-        {
-            "name": "search",
-            "description": "Search operations with functional composition",
-        },
-        {
-            "name": "stats",
-            "description": "Statistics and analytics with pure functions",
-        },
-        {
-            "name": "attachments",
-            "description": "File and image serving",
-        },
-        {
-            "name": "admin",
-            "description": "Administrative operations",
-        },
-        {
-            "name": "tenants",
-            "description": "Multi-tenant operations for infosec and quant content",
-        },
+        {"name": "posts", "description": "Blog post operations"},
+        {"name": "search", "description": "Search and discovery"},
+        {"name": "stats", "description": "Statistics and analytics"},
+        {"name": "tenants", "description": "Multi-tenant operations"},
+        {"name": "admin", "description": "Administrative operations"},
     ],
 )
-
-# Initialize global components
-blog_parser = FunctionalBlogParser(
-    posts_directory=str(settings.posts_directory),
-    max_workers=settings.max_workers
-)
-search_engine = SearchEngine()
-stats_cache = StatsCache()
-rate_limiter = EndpointRateLimiter()
 
 # CORS configuration
 app.add_middleware(
@@ -102,6 +75,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Request tracking middleware
 @app.middleware("http")
@@ -116,6 +90,7 @@ async def track_requests(request: Request, call_next):
     
     # Check rate limiting
     if settings.rate_limit_enabled:
+        rate_limiter = get_rate_limiter()
         client_ip = request.client.host if request.client else "unknown"
         allowed, limit_info = await rate_limiter.check_endpoint_limit(path, client_ip)
         
@@ -123,11 +98,12 @@ async def track_requests(request: Request, call_next):
             await metrics.increment("http_requests_rate_limited_total")
             return JSONResponse(
                 status_code=429,
-                content={
-                    "error": "Rate limit exceeded",
-                    "reason": limit_info.get("reason"),
-                    "retry_after": limit_info.get("retry_after")
-                },
+                content=error_response(
+                    "RATE_LIMIT_EXCEEDED",
+                    "Rate limit exceeded",
+                    details=limit_info,
+                    request_id=request_id
+                ).dict(),
                 headers={"Retry-After": str(int(limit_info.get("retry_after", 60)))}
             )
     
@@ -157,638 +133,277 @@ async def track_requests(request: Request, call_next):
                     method=method)
         raise
 
+
+# Exception handlers
+@app.exception_handler(BlogBackendException)
+async def blog_exception_handler(request: Request, exc: BlogBackendException):
+    """Handle custom blog exceptions"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=error_response(
+            exc.code,
+            exc.message,
+            details=exc.details,
+            request_id=request_id_var.get()
+        ).dict()
+    )
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    """Handle validation errors"""
+    return JSONResponse(
+        status_code=400,
+        content=error_response(
+            "VALIDATION_ERROR",
+            str(exc),
+            request_id=request_id_var.get()
+        ).dict()
+    )
+
+
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
     """Initialize application components"""
+    container = get_container()
     logger.info("Starting Blog Backend API", version=settings.app_version)
     
     # Start rate limiter cleanup tasks
     if settings.rate_limit_enabled:
-        await rate_limiter.start_all_cleanup_tasks()
+        await container.rate_limiter.start_all_cleanup_tasks()
     
     # Initialize search index
-    posts = await blog_parser.get_all_posts()
-    await search_engine.rebuild_index(posts)
+    posts = await container.blog_parser.get_all_posts()
+    await container.search_engine.rebuild_index(posts)
     
     logger.info("Application started", 
                 posts_loaded=len(posts),
                 search_index_ready=True,
-                rate_limiting=settings.rate_limit_enabled)
+                rate_limiting=settings.rate_limit_enabled,
+                cache_enabled=settings.cache_enabled)
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
+    container = get_container()
     logger.info("Shutting down Blog Backend API")
     
     # Stop rate limiter cleanup tasks
     if settings.rate_limit_enabled:
-        await rate_limiter.stop_all_cleanup_tasks()
+        await container.rate_limiter.stop_all_cleanup_tasks()
     
     logger.info("Application shutdown complete")
 
-# Pure functions for API logic
-def create_tag_filter(tag: str) -> callable:
-    """Pure function to create tag filter"""
-    return lambda posts: [post for post in posts if tag in post.tags]
 
-def create_author_filter(author: str) -> callable:
-    """Pure function to create author filter"""
-    return lambda posts: [post for post in posts if post.author and post.author.lower() == author.lower()]
+# API Endpoints
 
-def create_tenant_filter(tenant: TenantType) -> callable:
-    """Pure function to create tenant filter"""
-    return lambda posts: [post for post in posts if post.tenant == tenant]
-
-def create_date_sorter(reverse: bool = True) -> callable:
-    """Pure function to create date sorter"""
-    return lambda posts: sorted(posts, key=lambda p: p.date, reverse=reverse)
-
-def create_title_sorter(reverse: bool = False) -> callable:
-    """Pure function to create title sorter"""
-    return lambda posts: sorted(posts, key=lambda p: p.title.lower(), reverse=reverse)
-
-def create_author_sorter(reverse: bool = False) -> callable:
-    """Pure function to create author sorter"""
-    return lambda posts: sorted(posts, key=lambda p: (p.author or "").lower(), reverse=reverse)
-
-def apply_pagination(offset: int, limit: Optional[int] = None) -> callable:
-    """Pure function for pagination"""
-    if limit:
-        return lambda posts: posts[offset:offset + limit]
-    else:
-        return lambda posts: posts[offset:]
-
-def posts_to_summaries(posts: List[BlogPost]) -> List[BlogPostSummary]:
-    """Pure function to convert posts to summaries"""
-    return [
-        BlogPostSummary(
-            slug=post.slug,
-            title=post.title,
-            excerpt=post.excerpt,
-            tags=post.tags,
-            date=post.date,
-            author=post.author,
-            tenant=post.tenant,
-            sticky=post.sticky,
-            reading_time=post.reading_time
-        )
-        for post in posts
-    ]
-
-def calculate_blog_stats(posts: List[BlogPost]) -> BlogStats:
-    """Pure function to calculate blog statistics"""
-    # Count tags
-    tag_counter = Counter()
-    for post in posts:
-        tag_counter.update(post.tags)
-    
-    # Count authors
-    author_counter = Counter()
-    for post in posts:
-        if post.author:
-            author_counter[post.author] += 1
-    
-    # Count posts by month
-    posts_by_month = Counter()
-    for post in posts:
-        month_key = post.date.strftime("%Y-%m")
-        posts_by_month[month_key] += 1
-    
-    # Count posts by tenant
-    posts_by_tenant = Counter()
-    for post in posts:
-        posts_by_tenant[post.tenant] += 1
-    
-    return BlogStats(
-        total_posts=len(posts),
-        tags=dict(tag_counter),
-        authors=dict(author_counter),
-        posts_by_month=dict(posts_by_month),
-        posts_by_tenant=dict(posts_by_tenant)
-    )
-
-def calculate_tenant_stats(posts: List[BlogPost], tenant: TenantType) -> TenantStats:
-    """Pure function to calculate tenant-specific statistics"""
-    tenant_posts = [post for post in posts if post.tenant == tenant]
-    
-    # Count tags for this tenant
-    tag_counter = Counter()
-    for post in tenant_posts:
-        tag_counter.update(post.tags)
-    
-    # Count authors for this tenant
-    author_counter = Counter()
-    for post in tenant_posts:
-        if post.author:
-            author_counter[post.author] += 1
-    
-    # Count posts by month for this tenant
-    posts_by_month = Counter()
-    for post in tenant_posts:
-        month_key = post.date.strftime("%Y-%m")
-        posts_by_month[month_key] += 1
-    
-    # Get recent posts (last 5)
-    recent_posts = sorted(tenant_posts, key=lambda p: p.date, reverse=True)[:5]
-    recent_summaries = posts_to_summaries(recent_posts)
-    
-    return TenantStats(
-        tenant=tenant,
-        total_posts=len(tenant_posts),
-        tags=dict(tag_counter),
-        authors=dict(author_counter),
-        posts_by_month=dict(posts_by_month),
-        recent_posts=recent_summaries
-    )
-
-# API Endpoints using functional patterns
-
-@app.get(
-    "/",
-    summary="API Information",
-    description="Get basic information about the Functional Blog Backend API",
-    response_description="API information including version"
-)
+@app.get("/", tags=["admin"])
 async def root():
-    return {"message": "Blog Backend API", "version": "2.0.0", "features": ["functional_programming", "concurrent_processing", "nuitka_optimized"]}
+    """API information endpoint"""
+    return success_response({
+        "message": "Blog Backend API",
+        "version": settings.app_version,
+        "features": [
+            "clean_architecture",
+            "functional_programming", 
+            "concurrent_processing",
+            "multi_tenant_support",
+            "enhanced_search",
+            "rate_limiting",
+            "structured_logging",
+            "configurable_caching"
+        ]
+    })
 
-@app.get(
-    "/posts", 
-    response_model=List[BlogPostSummary],
-    tags=["posts"],
-    summary="List Blog Posts",
-    description="Get a paginated list of blog post summaries with optional sticky post prioritization",
-    response_description="List of blog post summaries"
-)
+
+@app.get("/posts", response_model=PaginatedResponse[BlogPostSummary], tags=["posts"])
 async def list_posts(
-    sort_by: Optional[str] = Query("date", regex="^(date|title|author)$", description="Field to sort by"),
-    order: Optional[str] = Query("desc", regex="^(asc|desc)$", description="Sort order"),
-    tag: Optional[str] = Query(None, description="Filter by tag"),
-    author: Optional[str] = Query(None, description="Filter by author"),
-    tenant: Optional[TenantType] = Query(None, description="Filter by tenant (infosec, quant, shared)"),
-    enable_sticky: bool = Query(True, description="Enable sticky posts (appear at top when 3+ posts)"),
-    limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum number of posts to return"),
-    offset: Optional[int] = Query(0, ge=0, description="Number of posts to skip")
+    sort_by: str = Query("date", regex="^(date|title|author)$"),
+    order: str = Query("desc", regex="^(asc|desc)$"),
+    tag: Optional[str] = Query(None),
+    author: Optional[str] = Query(None),
+    tenant: Optional[TenantType] = Query(None),
+    enable_sticky: bool = Query(True),
+    limit: Optional[int] = Query(None, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    post_service: PostService = Depends(get_post_service)
 ):
-    # Get all posts
-    posts = await blog_parser.get_all_posts()
+    """List blog posts with filtering, sorting, and pagination"""
     
-    # Apply filters
-    filtered_posts = posts
-    if tag:
-        filtered_posts = create_tag_filter(tag)(filtered_posts)
-    
-    if author:
-        filtered_posts = create_author_filter(author)(filtered_posts)
-    
-    if tenant:
-        filtered_posts = create_tenant_filter(tenant)(filtered_posts)
-    
-    # Apply sorting (with sticky support for date sorting)
-    reverse = order == "desc"
-    if sort_by == "date":
-        if enable_sticky:
-            # Use sticky-aware sorting
-            filtered_posts = apply_sticky_sorting(filtered_posts, enable_sticky, min_posts_for_sticky=3)
-            # If reversed order for non-sticky, we need to reverse the regular posts only
-            if not reverse:
-                sticky_posts = [p for p in filtered_posts if p.sticky]
-                regular_posts = [p for p in filtered_posts if not p.sticky]
-                regular_posts.sort(key=lambda p: p.date, reverse=False)  # Ascending
-                filtered_posts = sticky_posts + regular_posts
-        else:
-            filtered_posts = create_date_sorter(reverse)(filtered_posts)
-    elif sort_by == "title":
-        filtered_posts = create_title_sorter(reverse)(filtered_posts)
-    elif sort_by == "author":
-        filtered_posts = create_author_sorter(reverse)(filtered_posts)
-    
-    # Apply pagination
-    if offset > 0:
-        filtered_posts = filtered_posts[offset:]
-    if limit:
-        filtered_posts = filtered_posts[:limit]
-    
-    return posts_to_summaries(filtered_posts)
-
-@app.get(
-    "/posts/{slug}", 
-    response_model=BlogPost,
-    tags=["posts"],
-    summary="Get Blog Post",
-    description="Get a single blog post by its slug using functional approach",
-    response_description="Full blog post with content"
-)
-async def get_post(slug: str):
-    post = await blog_parser.get_post(slug)
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-    return post
-
-@app.get(
-    "/search", 
-    response_model=List[BlogPostSummary],
-    tags=["search"],
-    summary="Enhanced Search",
-    description="Search blog posts using advanced indexing with ranking and relevance scoring",
-    response_description="List of matching blog post summaries ranked by relevance"
-)
-async def search_posts(
-    q: str = Query(..., min_length=settings.search_min_length, max_length=security_settings.max_query_length, description="Search query"),
-    tenant: Optional[TenantType] = Query(None, description="Filter by tenant"),
-    limit: Optional[int] = Query(None, ge=1, le=settings.search_max_results, description="Maximum number of results")
-):
-    # Validate query length
-    if len(q.strip()) < settings.search_min_length:
-        raise HTTPException(status_code=400, detail="Query too short")
-    
-    # Use enhanced search engine
-    search_results = await search_engine.search(
-        query=q.strip(),
+    request = PostListRequest(
+        sort_field=SortField(sort_by),
+        sort_order=SortOrder(order),
         tenant=tenant,
-        limit=limit or 20
+        tag=tag,
+        author=author,
+        enable_sticky=enable_sticky,
+        offset=offset,
+        limit=limit
     )
     
-    # Get full post data for results
-    posts = await blog_parser.get_all_posts()
-    post_dict = {post.slug: post for post in posts}
+    posts = await post_service.list_posts(request)
     
-    # Convert search results to summaries
-    result_posts = []
-    for slug, score in search_results:
-        if slug in post_dict:
-            result_posts.append(post_dict[slug])
-    
-    await metrics.increment("search_queries_total", labels={"tenant": tenant or "all"})
-    logger.info("Search performed", query=q, tenant=tenant, results_count=len(result_posts))
-    
-    return posts_to_summaries(result_posts)
+    return paginated_response(
+        items=posts,
+        offset=offset,
+        limit=limit
+    )
 
-@app.get(
-    "/stats", 
-    response_model=BlogStats,
-    tags=["stats"],
-    summary="Get Blog Statistics",
-    description="Get comprehensive blog statistics using pure functions with optional caching",
-    response_description="Blog statistics and analytics"
-)
-async def get_stats():
-    async def compute_stats():
-        posts = await blog_parser.get_all_posts()
-        # Rebuild search index if needed
-        await search_engine.rebuild_index(posts)
-        return calculate_blog_stats(posts)
-    
-    if settings.cache_enabled:
-        return await stats_cache.get_stats(compute_stats)
-    else:
-        return await compute_stats()
 
-@app.get(
-    "/tags",
-    tags=["stats"],
-    summary="List Tags (Functional)",
-    description="Get all unique tags with their usage counts using functional approach",
-    response_description="List of tags with counts"
-)
-async def list_tags():
-    posts = await blog_parser.get_all_posts()
-    
-    # Functional approach to count tags
-    tag_counts = compose(
-        lambda posts: [tag for post in posts for tag in post.tags],  # Flatten tags
-        lambda tags: Counter(tags),  # Count occurrences
-        lambda counter: [{"tag": tag, "count": count} for tag, count in counter.most_common()]
-    )(posts)
-    
-    return tag_counts
-
-@app.get(
-    "/posts/by-tag/{tag}",
-    response_model=List[BlogPostSummary],
-    tags=["posts"],
-    summary="Get Posts by Tag",
-    description="Get posts filtered by a specific tag",
-    response_description="List of posts with the specified tag"
-)
-async def get_posts_by_tag(
-    tag: str,
-    limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum number of results")
+@app.get("/posts/all-tenants", response_model=PaginatedResponse[BlogPostSummary], tags=["posts"])
+async def list_all_tenant_posts(
+    sort_by: str = Query("date", regex="^(date|title|author)$"),
+    order: str = Query("desc", regex="^(asc|desc)$"),
+    tag: Optional[str] = Query(None),
+    author: Optional[str] = Query(None),
+    enable_sticky: bool = Query(True),
+    limit: Optional[int] = Query(None, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    post_service: PostService = Depends(get_post_service)
 ):
-    posts = await blog_parser.filter_by_tag(tag, limit)
-    return posts_to_summaries(posts)
+    """List posts from all tenants with filtering and sorting"""
+    
+    request = PostListRequest(
+        sort_field=SortField(sort_by),
+        sort_order=SortOrder(order),
+        tenant=None,  # All tenants
+        tag=tag,
+        author=author,
+        enable_sticky=enable_sticky,
+        offset=offset,
+        limit=limit
+    )
+    
+    posts = await post_service.list_posts(request)
+    
+    return paginated_response(
+        items=posts,
+        offset=offset,
+        limit=limit
+    )
 
-@app.get(
-    "/posts/by-author/{author}",
-    response_model=List[BlogPostSummary],
-    tags=["posts"],
-    summary="Get Posts by Author",
-    description="Get posts filtered by a specific author",
-    response_description="List of posts by the specified author"
-)
-async def get_posts_by_author(
-    author: str,
-    limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum number of results")
+
+@app.get("/posts/{slug}", response_model=BlogPost, tags=["posts"])
+async def get_post(
+    slug: str,
+    post_service: PostService = Depends(get_post_service)
 ):
-    posts = await blog_parser.filter_by_author(author, limit)
-    return posts_to_summaries(posts)
+    """Get a single blog post by slug"""
+    return await post_service.get_post(slug)
 
-@app.get(
-    "/attachments/{slug}/{path:path}",
-    tags=["attachments"],
-    summary="Get Attachment",
-    description="Serve blog post attachments (images, files)",
-    response_description="File content"
-)
-async def get_attachment(slug: str, path: str):
-    post = await blog_parser.get_post(slug)
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-    
-    # Security: ensure the path is in the post's attachments
-    if path not in post.attachments and f"{slug}_assets/{path}" not in post.attachments:
-        raise HTTPException(status_code=404, detail="Attachment not found")
-    
-    file_path = blog_parser.posts_directory / path
-    if not file_path.exists():
-        file_path = blog_parser.posts_directory / f"{slug}_assets" / path
-    
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    return FileResponse(file_path)
 
-@app.post(
-    "/refresh",
-    tags=["admin"],
-    summary="Refresh Cache (Functional)",
-    description="Force refresh the blog posts cache using concurrent processing",
-    response_description="Cache refresh status with performance metrics"
-)
-async def refresh_posts():
-    start_time = datetime.now()
-    
-    result = await blog_parser.scan_posts_concurrent(force_refresh=True)
-    
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds()
-    
-    from .functional_types import Success, Failure
-    
-    match result:
-        case Success(posts_dict):
-            return {
-                "message": "Posts cache refreshed successfully",
-                "post_count": len(posts_dict),
-                "duration_seconds": duration,
-                "concurrent_processing": True
-            }
-        case Failure(errors):
-            return {
-                "message": f"Cache refresh completed with {len(errors)} errors",
-                "post_count": len(blog_parser._posts_cache),
-                "errors": [error.message for error in errors[:5]],  # Show first 5 errors
-                "duration_seconds": duration,
-                "concurrent_processing": True
-            }
+@app.get("/posts/{slug}/related", response_model=List[BlogPostSummary], tags=["posts"])
+async def get_related_posts(
+    slug: str,
+    limit: int = Query(5, ge=1, le=10),
+    post_service: PostService = Depends(get_post_service)
+):
+    """Get posts related to the given post"""
+    return await post_service.get_related_posts(slug, limit)
 
-# Health check endpoint
-# Tenant-specific endpoints
-@app.get(
-    "/tenants",
-    tags=["tenants"],
-    summary="List Tenants",
-    description="Get list of available tenants",
-    response_description="List of available tenants with descriptions"
-)
+
+@app.get("/search", response_model=List[BlogPostSummary], tags=["search"])
+async def search_posts(
+    q: str = Query(..., min_length=1),
+    tenant: Optional[TenantType] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=100),
+    post_service: PostService = Depends(get_post_service)
+):
+    """Search blog posts with advanced indexing"""
+    
+    request = SearchRequest(
+        query=q,
+        tenant=tenant,
+        limit=limit
+    )
+    
+    return await post_service.search_posts(request)
+
+
+@app.get("/search/suggest", response_model=SuggestionsResponse, tags=["search"])
+async def search_suggest(
+    q: str = Query(..., min_length=1, max_length=50),
+    limit: int = Query(5, ge=1, le=10),
+    post_service: PostService = Depends(get_post_service)
+):
+    """Get search suggestions"""
+    suggestions = await post_service.get_suggestions(q, limit)
+    
+    return SuggestionsResponse(
+        suggestions=suggestions,
+        query=q
+    )
+
+
+@app.get("/stats", response_model=BlogStats, tags=["stats"])
+async def get_stats(
+    stats_service: StatsService = Depends(get_stats_service)
+):
+    """Get blog statistics"""
+    return await stats_service.get_blog_stats()
+
+
+@app.get("/tenants", response_model=TenantsListResponse, tags=["tenants"])
 async def list_tenants():
-    return [
+    """Get list of available tenants"""
+    tenants = [
         {"tenant": "infosec", "name": "Information Security", "description": "Security research, threat analysis, and defensive strategies"},
         {"tenant": "quant", "name": "Quantitative Finance", "description": "Algorithmic trading, market analysis, and quantitative research"},
         {"tenant": "shared", "name": "Shared Content", "description": "General updates and cross-domain content"}
     ]
-
-@app.get(
-    "/tenants/{tenant}",
-    response_model=TenantStats,
-    tags=["tenants"],
-    summary="Get Tenant Statistics",
-    description="""
-    Get comprehensive statistics for a specific tenant including:
-    - Total post count for the tenant
-    - Tag usage statistics
-    - Author contributions
-    - Posts by month timeline
-    - Recent posts (last 5)
     
-    Perfect for dashboard widgets and tenant overview pages.
-    """,
-    response_description="Tenant-specific statistics including recent posts"
-)
-async def get_tenant_stats(tenant: TenantType):
-    posts = await blog_parser.get_all_posts()
-    return calculate_tenant_stats(posts, tenant)
+    return TenantsListResponse(tenants=tenants)
 
-@app.get(
-    "/tenants/{tenant}/posts",
-    response_model=List[BlogPostSummary],
-    tags=["tenants"],
-    summary="Get Posts by Tenant",
-    description="Get posts for a specific tenant with sorting, pagination, and sticky post support",
-    response_description="List of posts for the specified tenant"
-)
+
+@app.get("/tenants/{tenant}", response_model=TenantStats, tags=["tenants"])
+async def get_tenant_stats(
+    tenant: TenantType,
+    stats_service: StatsService = Depends(get_stats_service)
+):
+    """Get tenant-specific statistics"""
+    return await stats_service.get_tenant_stats(tenant)
+
+
+@app.get("/tenants/{tenant}/posts", response_model=PaginatedResponse[BlogPostSummary], tags=["tenants"])
 async def get_tenant_posts(
     tenant: TenantType,
-    limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum number of posts to return"),
-    offset: Optional[int] = Query(0, ge=0, description="Number of posts to skip"),
-    sort_by: Optional[str] = Query("date", regex="^(date|title|author)$", description="Field to sort by"),
-    order: Optional[str] = Query("desc", regex="^(asc|desc)$", description="Sort order"),
-    enable_sticky: bool = Query(True, description="Enable sticky posts (appear at top when 3+ posts)")
+    sort_by: str = Query("date", regex="^(date|title|author)$"),
+    order: str = Query("desc", regex="^(asc|desc)$"),
+    enable_sticky: bool = Query(True),
+    limit: Optional[int] = Query(None, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    post_service: PostService = Depends(get_post_service)
 ):
-    posts = await blog_parser.filter_by_tenant(tenant)
+    """Get posts for a specific tenant"""
     
-    # Apply sorting (with sticky support for date sorting)
-    reverse = order == "desc"
-    if sort_by == "date":
-        if enable_sticky:
-            # Use sticky-aware sorting
-            posts = apply_sticky_sorting(posts, enable_sticky, min_posts_for_sticky=3)
-            # If reversed order for non-sticky, we need to reverse the regular posts only
-            if not reverse:
-                sticky_posts = [p for p in posts if p.sticky]
-                regular_posts = [p for p in posts if not p.sticky]
-                regular_posts.sort(key=lambda p: p.date, reverse=False)  # Ascending
-                posts = sticky_posts + regular_posts
-        else:
-            posts = sorted(posts, key=lambda p: p.date, reverse=reverse)
-    elif sort_by == "title":
-        posts = sorted(posts, key=lambda p: p.title.lower(), reverse=reverse)
-    elif sort_by == "author":
-        posts = sorted(posts, key=lambda p: (p.author or "").lower(), reverse=reverse)
+    request = PostListRequest(
+        sort_field=SortField(sort_by),
+        sort_order=SortOrder(order),
+        tenant=tenant,
+        enable_sticky=enable_sticky,
+        offset=offset,
+        limit=limit
+    )
     
-    # Apply pagination
-    if offset > 0:
-        posts = posts[offset:]
-    if limit:
-        posts = posts[:limit]
+    posts = await post_service.list_posts(request)
     
-    return posts_to_summaries(posts)
+    return paginated_response(
+        items=posts,
+        offset=offset,
+        limit=limit
+    )
 
-@app.get(
-    "/tenants/{tenant}/recent",
-    response_model=List[BlogPostSummary],
-    tags=["tenants"],
-    summary="Get Recent Posts by Tenant",
-    description="Get recent posts for a specific tenant",
-    response_description="Recent posts for the specified tenant"
-)
-async def get_tenant_recent_posts(
-    tenant: TenantType,
-    limit: int = Query(5, ge=1, le=20, description="Number of recent posts to return")
-):
-    return await blog_parser.get_recent_by_tenant(tenant, limit)
 
-@app.get(
-    "/tenants/{tenant}/tags",
-    tags=["tenants"],
-    summary="Get Tags by Tenant",
-    description="Get all tags used by posts in a specific tenant",
-    response_description="List of tags with counts for the specified tenant"
-)
-async def get_tenant_tags(tenant: TenantType):
-    posts = await blog_parser.filter_by_tenant(tenant)
-    
-    # Functional approach to count tags for this tenant
-    tag_counts = compose(
-        lambda posts: [tag for post in posts for tag in post.tags],  # Flatten tags
-        lambda tags: Counter(tags),  # Count occurrences
-        lambda counter: [{"tag": tag, "count": count} for tag, count in counter.most_common()]
-    )(posts)
-    
-    return tag_counts
-
-@app.get(
-    "/posts/all-tenants",
-    response_model=List[BlogPostSummary],
-    tags=["posts"],
-    summary="List All Posts Across Tenants",
-    description="Get posts from all tenants with optional sticky post prioritization and filtering",
-    response_description="List of blog post summaries from all tenants"
-)
-async def list_all_tenant_posts(
-    sort_by: Optional[str] = Query("date", regex="^(date|title|author)$", description="Field to sort by"),
-    order: Optional[str] = Query("desc", regex="^(asc|desc)$", description="Sort order"),
-    tag: Optional[str] = Query(None, description="Filter by tag"),
-    author: Optional[str] = Query(None, description="Filter by author"),
-    enable_sticky: bool = Query(True, description="Enable sticky posts (appear at top when 3+ posts)"),
-    limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum number of posts to return"),
-    offset: Optional[int] = Query(0, ge=0, description="Number of posts to skip")
-):
-    """Get all posts from all tenants with optional sticky prioritization"""
-    # Get all posts (from all tenants)
-    posts = await blog_parser.get_all_posts()
-    
-    # Apply filters (but not tenant filter since we want all tenants)
-    filtered_posts = posts
-    if tag:
-        filtered_posts = create_tag_filter(tag)(filtered_posts)
-    
-    if author:
-        filtered_posts = create_author_filter(author)(filtered_posts)
-    
-    # Apply sorting (with sticky support for date sorting)
-    reverse = order == "desc"
-    if sort_by == "date":
-        if enable_sticky:
-            # Use sticky-aware sorting
-            filtered_posts = apply_sticky_sorting(filtered_posts, enable_sticky, min_posts_for_sticky=3)
-            # If reversed order for non-sticky, we need to reverse the regular posts only
-            if not reverse:
-                sticky_posts = [p for p in filtered_posts if p.sticky]
-                regular_posts = [p for p in filtered_posts if not p.sticky]
-                regular_posts.sort(key=lambda p: p.date, reverse=False)  # Ascending
-                filtered_posts = sticky_posts + regular_posts
-        else:
-            filtered_posts = create_date_sorter(reverse)(filtered_posts)
-    elif sort_by == "title":
-        filtered_posts = create_title_sorter(reverse)(filtered_posts)
-    elif sort_by == "author":
-        filtered_posts = create_author_sorter(reverse)(filtered_posts)
-    
-    # Apply pagination
-    if offset > 0:
-        filtered_posts = filtered_posts[offset:]
-    if limit:
-        filtered_posts = filtered_posts[:limit]
-    
-    return posts_to_summaries(filtered_posts)
-
-# New enhanced endpoints
-@app.get(
-    "/search/suggest",
-    tags=["search"],
-    summary="Search Suggestions",
-    description="Get auto-complete suggestions for search queries",
-    response_description="List of suggested search terms"
-)
-async def search_suggest(
-    q: str = Query(..., min_length=1, max_length=50, description="Search prefix"),
-    limit: int = Query(5, ge=1, le=10, description="Maximum number of suggestions")
-):
-    suggestions = await search_engine.suggest(q, limit)
-    return {"suggestions": suggestions}
-
-@app.get(
-    "/posts/{slug}/related",
-    response_model=List[BlogPostSummary],
-    tags=["posts"],
-    summary="Related Posts",
-    description="Find posts related to the given post",
-    response_description="List of related post summaries"
-)
-async def get_related_posts(slug: str, limit: int = Query(5, ge=1, le=10)):
-    post = await blog_parser.get_post(slug)
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-    
-    related_slugs = await search_engine.get_related_posts(slug, limit)
-    
-    # Get post data for related posts
-    posts = await blog_parser.get_all_posts()
-    post_dict = {p.slug: p for p in posts}
-    
-    related_posts = [post_dict[s] for s in related_slugs if s in post_dict]
-    return posts_to_summaries(related_posts)
-
-@app.get(
-    "/metrics",
-    tags=["admin"],
-    summary="Application Metrics",
-    description="Get application performance metrics",
-    response_description="Performance and usage metrics"
-)
-async def get_metrics():
-    metrics_summary = await metrics.get_summary()
-    search_stats = await search_engine.get_stats()
-    
-    return {
-        "performance": metrics_summary,
-        "search_index": search_stats,
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
-@app.get(
-    "/health",
-    tags=["admin"],
-    summary="Enhanced Health Check",
-    description="Comprehensive health check with dependency verification"
-)
+@app.get("/health", response_model=HealthResponse, tags=["admin"])
 async def health_check():
+    """Comprehensive health check"""
+    container = get_container()
+    
     try:
-        posts = await blog_parser.get_all_posts()
-        tenant_counts = Counter(post.tenant for post in posts)
-        search_stats = await search_engine.get_stats()
+        posts = await container.blog_parser.get_all_posts()
+        search_stats = await container.search_engine.get_stats()
         
         # Check if minimum posts threshold is met
         posts_healthy = len(posts) >= settings.health_check_posts_threshold
@@ -796,24 +411,64 @@ async def health_check():
         
         status = "healthy" if posts_healthy and search_healthy else "degraded"
         
-        return {
-            "status": status,
+        checks = {
             "posts_loaded": len(posts),
-            "tenants": dict(tenant_counts),
             "search_index": search_stats,
             "functional_parser": True,
             "concurrent_processing": True,
-            "max_workers": blog_parser.max_workers,
+            "max_workers": container.blog_parser.max_workers,
             "rate_limiting": settings.rate_limit_enabled,
-            "caching_enabled": True,
-            "version": settings.app_version
+            "caching_enabled": settings.cache_enabled,
         }
+        
+        return HealthResponse(
+            status=status,
+            version=settings.app_version,
+            checks=checks
+        )
+        
     except Exception as e:
         logger.error("Health check failed", error=str(e))
-        return {
-            "status": "unhealthy",
-            "error": str(e),
-            "functional_parser": True,
-            "concurrent_processing": True,
-            "version": settings.app_version
-        }
+        return HealthResponse(
+            status="unhealthy",
+            version=settings.app_version,
+            checks={"error": str(e)}
+        )
+
+
+@app.get("/metrics", response_model=MetricsResponse, tags=["admin"])
+async def get_metrics(
+    search_engine: SearchEngine = Depends(get_search_engine)
+):
+    """Get application metrics"""
+    metrics_summary = await metrics.get_summary()
+    search_stats = await search_engine.get_stats()
+    
+    return MetricsResponse(
+        performance=metrics_summary,
+        search_index=search_stats
+    )
+
+
+# File serving endpoints (kept minimal for backward compatibility)
+@app.get("/attachments/{slug}/{path:path}", tags=["attachments"])
+async def get_attachment(slug: str, path: str):
+    """Serve blog post attachments"""
+    container = get_container()
+    post = await container.blog_parser.get_post(slug)
+    
+    if not post:
+        raise PostNotFoundError(slug)
+    
+    # Security: ensure the path is in the post's attachments
+    if path not in post.attachments and f"{slug}_assets/{path}" not in post.attachments:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    
+    file_path = container.blog_parser.posts_directory / path
+    if not file_path.exists():
+        file_path = container.blog_parser.posts_directory / f"{slug}_assets" / path
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(file_path)

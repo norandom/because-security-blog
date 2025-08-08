@@ -22,7 +22,7 @@ if __name__ == "__main__":
             pass  # uvloop not available, use default
     
     uvicorn.run(
-        "blog_backend.main_v2:app",
+        "blog_backend.main:app",
         host=host,
         port=port,
         workers=1,  # Single worker for Nuitka - concurrency handled internally
